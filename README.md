@@ -1,13 +1,12 @@
 # ArUco Marker Tracker for Event Camera
 
-Track ArUco markers using event camera with 3D pose estimation.
+Track ArUco markers using event camera GenX320 with 3D pose estimation.
 
 ## Features
 
 - Real-time marker detection and tracking
 - Template-based pattern matching for event camera images
 - 3D position estimation (X, Y, Z)
-- Lock-on tracking with automatic recovery
 
 ## Requirements
 

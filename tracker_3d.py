@@ -1,434 +1,127 @@
 import cv2
 import numpy as np
-import json
-import os
+import time
 from metavision_core.event_io import EventsIterator
 
-# ================= CONFIGURATION =================
-CONFIG_FILE = "/home/raspi5/settings.json"
-MARKER_TEMPLATE = "/home/raspi5/Desktop/event_cam/ArUco_track/marker_9_edges.png"
+# ================= SYSTEM CONFIGURATION =================
 
-# Detection Parameters
-# MIN_AREA: Minimum contour area in pixels. Smaller values detect smaller/tilted markers.
-# MAX_AREA: Maximum contour area in pixels. Filters out very large false detections.
-# MATCH_THRESHOLD: Template matching score threshold (0-1). Lower values are more lenient.
-MIN_AREA = 400
-MAX_AREA = 150000
-MATCH_THRESHOLD = 0.25
-
-# Shape Constraints
-# MAX_ASPECT_RATIO: Maximum ratio of longest/shortest side. Controls how stretched the quad can be.
-# MIN_ANGLE: Minimum interior angle in degrees. Prevents very sharp corners.
-# MAX_ANGLE: Maximum interior angle in degrees. Prevents very flat corners.
-MAX_ASPECT_RATIO = 2.5
-MIN_ANGLE = 30
-MAX_ANGLE = 150
-
-# Locking Parameters
-# LOCK_SEARCH_RADIUS: Pixel radius to search for marker after locked.
-# LOCK_CONFIRM_FRAMES: Number of consecutive frames needed to confirm and lock a target.
-# STATIC_THRESHOLD: Event count below this is considered static (no movement).
-# MAX_SIZE_CHANGE: Maximum allowed area ratio change between frames when locked.
-LOCK_SEARCH_RADIUS = 100
-LOCK_CONFIRM_FRAMES = 3
-STATIC_THRESHOLD = 30
-MAX_SIZE_CHANGE = 2.0
-
-# 3D Pose Estimation Parameters
-# MARKER_SIZE: Physical size of the marker in meters (e.g., 0.08 = 8cm).
-MARKER_SIZE = 0.08
-
-# Camera Intrinsic Parameters (320x320 resolution)
-# CAMERA_MATRIX: 3x3 matrix containing focal length (fx, fy) and principal point (cx, cy).
-# DIST_COEFFS: Distortion coefficients. Set to zero for event cameras with minimal distortion.
+# Physical parameters for PnP solver
+MARKER_SIZE = 0.02      # Physical size of the marker in meters
 CAMERA_MATRIX = np.array([
     [320, 0, 160],
     [0, 320, 160],
     [0, 0, 1]
-], dtype=np.float32)
-DIST_COEFFS = np.zeros((5, 1), dtype=np.float32)
+], dtype=np.float32)    # Intrinsic matrix: [fx, 0, cx], [0, fy, cy], [0, 0, 1]
+DIST_COEFFS = np.zeros((5, 1), dtype=np.float32) # Distortion coefficients
 
+# Event processing parameters
+DELTA_T = 10000         # Integration time window in microseconds (10ms)
+DECAY_FACTOR = 0.90     # Leaky integrator decay rate (0.0-1.0); higher = longer trails
+MEMORY_TIME = 2.0       # Time in seconds to hold last valid position signal
 
-def load_camera_config(iterator, config_path):
+class PositionLatch:
     """
-    Load camera bias settings from JSON configuration file.
-    Adjusts event camera sensitivity parameters.
+    Implements a zero-order hold to maintain position state during signal loss.
     """
-    if not os.path.exists(config_path):
-        return
-    try:
-        if hasattr(iterator, 'reader'):
-            device = iterator.reader.device
-            biases = device.get_i_ll_biases()
-            with open(config_path, 'r') as f:
-                conf = json.load(f)
-            if "ll_biases_state" in conf:
-                for item in conf["ll_biases_state"]["bias"]:
-                    try:
-                        biases.set(item["name"], item["value"])
-                    except:
-                        pass
-    except:
-        pass
+    def __init__(self, timeout=1.0):
+        self.last_pos = None
+        self.last_seen_time = 0
+        self.timeout = timeout
 
-
-def calc_angle(p1, p2, p3):
-    """
-    Calculate angle at point p2 formed by points p1-p2-p3.
-    Returns angle in degrees.
-    """
-    v1 = np.array([p1[0] - p2[0], p1[1] - p2[1]])
-    v2 = np.array([p3[0] - p2[0], p3[1] - p2[1]])
-
-    cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
-    cos_angle = np.clip(cos_angle, -1, 1)
-    angle = np.degrees(np.arccos(cos_angle))
-
-    return angle
-
-
-def is_valid_quad(corners):
-    """
-    Check if quadrilateral has reasonable shape.
-    Validates interior angles and side length ratios.
-    Returns True if shape is acceptable.
-    """
-    pts = corners.reshape(4, 2)
-
-    # Check all 4 interior angles
-    angles = []
-    for i in range(4):
-        p1 = pts[i]
-        p2 = pts[(i + 1) % 4]
-        p3 = pts[(i + 2) % 4]
-        angle = calc_angle(p1, p2, p3)
-        angles.append(angle)
-
-    # All angles must be within range
-    for angle in angles:
-        if angle < MIN_ANGLE or angle > MAX_ANGLE:
-            return False
-
-    # Check side length ratios
-    sides = []
-    for i in range(4):
-        p1 = pts[i]
-        p2 = pts[(i + 1) % 4]
-        length = np.sqrt((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2)
-        sides.append(length)
-
-    if min(sides) < 1:
-        return False
-
-    side_ratio = max(sides) / min(sides)
-    if side_ratio > MAX_ASPECT_RATIO:
-        return False
-
-    return True
-
-
-def find_rectangles(contours):
-    """
-    Filter contours to find quadrilateral candidates that could be markers.
-    Applies shape validation to reject distorted quads.
-    Returns list of valid candidates.
-    """
-    candidates = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < MIN_AREA or area > MAX_AREA:
-            continue
-
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.05 * peri, True)
-
-        if len(approx) != 4:
-            continue
-
-        # Must be convex
-        if not cv2.isContourConvex(approx):
-            continue
-
-        rect = cv2.minAreaRect(cnt)
-        w, h = rect[1]
-        if w == 0 or h == 0:
-            continue
-
-        aspect = max(w, h) / min(w, h)
-        if aspect > MAX_ASPECT_RATIO:
-            continue
-
-        corners = approx.reshape(4, 2).astype(np.float32)
-
-        # Validate quadrilateral shape
-        if not is_valid_quad(corners):
-            continue
-
-        corners = order_corners(corners)
-
-        M = cv2.moments(cnt)
-        if M["m00"] > 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-
-            candidates.append({
-                'center': (cx, cy),
-                'area': area,
-                'rect': rect,
-                'corners': corners
-            })
-
-    return candidates
-
-
-def order_corners(pts):
-    """
-    Sort 4 corner points in order: top-left, top-right, bottom-right, bottom-left.
-    Required for consistent pose estimation.
-    """
-    pts = pts.astype(np.float32)
-    sorted_by_y = pts[np.argsort(pts[:, 1])]
-    top = sorted_by_y[:2][np.argsort(sorted_by_y[:2, 0])]
-    bottom = sorted_by_y[2:][np.argsort(sorted_by_y[2:, 0])]
-    return np.array([top[0], top[1], bottom[1], bottom[0]], dtype=np.float32)
-
-
-def estimate_pose(corners_2d):
-    """
-    Estimate 3D position of marker using PnP algorithm.
-    Returns translation vector (x, y, z) in meters and success flag.
-    """
-    half = MARKER_SIZE / 2.0
-    corners_3d = np.array([
-        [-half, -half, 0], [half, -half, 0],
-        [half, half, 0], [-half, half, 0]
-    ], dtype=np.float32)
-
-    corners_2d = corners_2d.reshape(-1, 1, 2).astype(np.float32)
-    success, rvec, tvec = cv2.solvePnP(
-        corners_3d, corners_2d, CAMERA_MATRIX, DIST_COEFFS,
-        flags=cv2.SOLVEPNP_IPPE_SQUARE
-    )
-    return (tvec.flatten(), success) if success else (None, False)
-
-
-def extract_roi(image, rect):
-    """
-    Extract rotated region of interest from image based on minimum area rectangle.
-    Returns cropped and aligned ROI for template matching.
-    """
-    center, size, angle = rect
-    w, h = int(size[0]), int(size[1])
-    if w < 15 or h < 15:
-        return None
-
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    rotated = cv2.warpAffine(image, M, (image.shape[1], image.shape[0]))
-
-    cx, cy = int(center[0]), int(center[1])
-    x1, y1 = max(0, cx - w // 2), max(0, cy - h // 2)
-    x2, y2 = min(image.shape[1], cx + w // 2), min(image.shape[0], cy + h // 2)
-
-    return rotated[y1:y2, x1:x2] if x2 > x1 and y2 > y1 else None
-
-
-def match_pattern(roi, template):
-    """
-    Match ROI against template using normalized cross-correlation.
-    Tests 4 rotations and flips to handle different orientations.
-    Returns best match score (0-1).
-    """
-    if roi is None or roi.size == 0:
-        return 0
-
-    h, w = roi.shape[:2]
-    if h < 15 or w < 15:
-        return 0
-
-    try:
-        roi_r = cv2.resize(roi, (50, 50))
-        tmpl_r = cv2.resize(template, (50, 50))
-    except:
-        return 0
-
-    _, roi_bin = cv2.threshold(roi_r, 30, 255, cv2.THRESH_BINARY)
-    _, tmpl_bin = cv2.threshold(tmpl_r, 30, 255, cv2.THRESH_BINARY)
-
-    if np.sum(roi_bin > 0) < 50:
-        return 0
-
-    best = 0
-    for k in range(4):
-        rot = np.rot90(tmpl_bin, k)
-        result = cv2.matchTemplate(roi_bin, rot, cv2.TM_CCOEFF_NORMED)
-        best = max(best, result.max())
-
-        flip_h = cv2.flip(rot, 1)
-        result = cv2.matchTemplate(roi_bin, flip_h, cv2.TM_CCOEFF_NORMED)
-        best = max(best, result.max())
-
-    return best
-
-
-def dist(p1, p2):
-    """
-    Calculate Euclidean distance between two 2D points.
-    """
-    return np.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
-
-
-def draw_quad(img, corners, color, thickness=2):
-    """
-    Draw quadrilateral on image using 4 corner points.
-    """
-    pts = corners.astype(np.int32).reshape((-1, 1, 2))
-    cv2.polylines(img, [pts], True, color, thickness)
-
+    def update(self, pos):
+        """
+        Updates state with new observation or returns latched state if within timeout.
+        Returns: (position, is_realtime: bool)
+        """
+        if pos is not None:
+            self.last_pos = pos
+            self.last_seen_time = time.time()
+            return pos, True
+        else:
+            if time.time() - self.last_seen_time < self.timeout:
+                return self.last_pos, False
+            return None, False
 
 def main():
-    """
-    Main tracking loop:
-    1. Capture events from camera
-    2. Find quadrilateral candidates
-    3. Match against template to identify marker
-    4. Lock onto marker and track position
-    5. Estimate 3D pose and output coordinates
-    """
-    template = cv2.imread(MARKER_TEMPLATE, cv2.IMREAD_GRAYSCALE)
-    if template is None:
-        print("Template not found")
-        return
-    _, template = cv2.threshold(template, 30, 255, cv2.THRESH_BINARY)
+    # --- 1. Initialize ArUco Detector ---
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    params = cv2.aruco.DetectorParameters()
+    
+    # Use SUBPIX refinement for stability on noisy event edges
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    # Allow detection of small markers (min 5% of image perimeter)
+    params.minMarkerPerimeterRate = 0.05
 
-    print("'q' quit, 'r' reset, 's' set origin")
-
-    mv_iterator = EventsIterator(input_path="", delta_t=10000, mode="delta_t")
-    load_camera_config(mv_iterator, CONFIG_FILE)
+    # --- 2. Initialize Event Stream & Buffer ---
+    mv_iterator = EventsIterator(input_path="", delta_t=DELTA_T, mode="delta_t")
     h, w = mv_iterator.get_size()
+    
+    # Accumulation buffer (Float32 for precision decay)
+    canvas = np.full((h, w), 127.0, dtype=np.float32)
+    
+    # State latchers for target IDs
+    latch_6 = PositionLatch(timeout=MEMORY_TIME)
+    latch_7 = PositionLatch(timeout=MEMORY_TIME)
 
-    cv2.namedWindow("Marker", cv2.WINDOW_NORMAL)
-
-    locked = False
-    locked_center = None
-    locked_corners = None
-    locked_area = None
-    locked_rect = None
-
-    origin = None
-
-    candidate_center = None
-    candidate_corners = None
-    candidate_area = None
-    candidate_rect = None
-    confirm_count = 0
+    print("System Ready. Active tracking initialized.")
 
     for evs in mv_iterator:
-        im = np.zeros((h, w), dtype=np.uint8)
+        # --- Image Reconstruction (Leaky Integrator) ---
+        # Apply exponential decay to simulate visual persistence
+        canvas = canvas * DECAY_FACTOR + 127 * (1 - DECAY_FACTOR)
+
         if evs.size > 0:
-            im[evs['y'], evs['x']] = 255
+            x, y, p = evs['x'], evs['y'], evs['p']
+            
+            # Update polarity: ON=+50, OFF=-50
+            update_val = np.zeros_like(x, dtype=np.float32)
+            update_val[p == 1] = 50.0
+            update_val[p == 0] = -50.0
+            np.add.at(canvas, (y, x), update_val)
 
-        im_display = cv2.cvtColor(im, cv2.COLOR_GRAY2BGR)
+        # Clip to uint8 range for OpenCV
+        img_display = np.clip(canvas, 0, 255).astype(np.uint8)
 
-        if evs.size < STATIC_THRESHOLD:
-            if locked:
-                draw_quad(im_display, locked_corners, (0, 200, 200), 2)
-                cv2.circle(im_display, locked_center, 4, (0, 0, 255), -1)
-            cv2.imshow("Marker", im_display)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            continue
+        # Optional: Gaussian blur to reduce high-frequency noise
+        img_blur = cv2.GaussianBlur(img_display, (3, 3), 0)
+        img_color = cv2.cvtColor(img_blur, cv2.COLOR_GRAY2BGR)
 
-        kernel = np.ones((2, 2), np.uint8)
-        im_clean = cv2.dilate(im, kernel, iterations=1)
+        # --- Marker Detection & Pose Estimation ---
+        corners, ids, _ = cv2.aruco.detectMarkers(img_blur, aruco_dict, parameters=params)
 
-        contours, _ = cv2.findContours(im_clean, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        candidates = find_rectangles(contours)
+        raw_pos_6 = None
+        raw_pos_7 = None
 
-        if locked:
-            best = None
-            best_score = 0
-            for c in candidates:
-                if dist(c['center'], locked_center) > LOCK_SEARCH_RADIUS:
-                    continue
-                ratio = c['area'] / locked_area
-                if not (1 / MAX_SIZE_CHANGE < ratio < MAX_SIZE_CHANGE):
-                    continue
-                score = match_pattern(extract_roi(im_clean, c['rect']), template)
-                if score > best_score and score > MATCH_THRESHOLD * 0.7:
-                    best_score = score
-                    best = c
+        if ids is not None:
+            rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(corners, MARKER_SIZE, CAMERA_MATRIX, DIST_COEFFS)
+            cv2.aruco.drawDetectedMarkers(img_color, corners, ids)
 
-            if best:
-                locked_center = best['center']
-                locked_corners = best['corners']
-                locked_area = best['area']
-                locked_rect = best['rect']
+            for i, marker_id in enumerate(ids.flatten()):
+                if marker_id == 6: raw_pos_6 = tvecs[i][0]
+                if marker_id == 7: raw_pos_7 = tvecs[i][0]
 
-            draw_quad(im_display, locked_corners, (0, 255, 0), 2)
-            cv2.circle(im_display, locked_center, 4, (0, 0, 255), -1)
+        # --- Position Latching & Distance Calculation ---
+        pos_6, is_realtime_6 = latch_6.update(raw_pos_6)
+        pos_7, is_realtime_7 = latch_7.update(raw_pos_7)
 
-            tvec, ok = estimate_pose(locked_corners)
-            if ok:
-                x, y, z = tvec * 100
-                if origin is not None:
-                    dx, dy, dz = (tvec - origin) * 1000
-                    print(f"\rdX:{dx:+.1f} dY:{dy:+.1f} dZ:{dz:+.1f}mm  ", end="")
-                else:
-                    print(f"\rX:{x:.1f} Y:{y:.1f} Z:{z:.1f}cm  ", end="")
+        if pos_6 is not None and pos_7 is not None:
+            dist_cm = np.linalg.norm(pos_6 - pos_7) * 100
+            
+            # Status: LIVE (Green) or MEM (Yellow)
+            is_live = is_realtime_6 and is_realtime_7
+            color = (0, 255, 0) if is_live else (0, 255, 255)
+            status_text = "LIVE" if is_live else "MEM"
 
-        else:
-            best = None
-            best_score = 0
-            for c in candidates:
-                score = match_pattern(extract_roi(im_clean, c['rect']), template)
-                if score > best_score and score > MATCH_THRESHOLD:
-                    best_score = score
-                    best = c
+            cv2.putText(img_color, f"Dist: {dist_cm:.2f}cm [{status_text}]", (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            
+            print(f"\rDist: {dist_cm:.2f} cm ({status_text})   ", end="")
 
-            if best:
-                if candidate_center and dist(best['center'], candidate_center) < 50:
-                    confirm_count += 1
-                else:
-                    confirm_count = 1
-
-                candidate_center = best['center']
-                candidate_corners = best['corners']
-                candidate_area = best['area']
-                candidate_rect = best['rect']
-
-                if confirm_count >= LOCK_CONFIRM_FRAMES:
-                    locked = True
-                    locked_center = candidate_center
-                    locked_corners = candidate_corners
-                    locked_area = candidate_area
-                    locked_rect = candidate_rect
-                    confirm_count = 0
-                else:
-                    draw_quad(im_display, candidate_corners, (255, 150, 0), 1)
-            else:
-                candidate_center = None
-                confirm_count = 0
-
-        cv2.imshow("Marker", im_display)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        cv2.imshow("Event Tracker", img_color)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-        elif key == ord('r'):
-            locked = False
-            locked_center = None
-            candidate_center = None
-            confirm_count = 0
-            origin = None
-            print("\nReset")
-        elif key == ord('s') and locked:
-            tvec, ok = estimate_pose(locked_corners)
-            if ok:
-                origin = tvec
-                print(f"\nOrigin set")
 
     cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     main()

@@ -1,15 +1,15 @@
-# ArUco Marker Tracker for Event Camera
+# ArUco Marker Tracker on Gripper for Event Camera
 
-Track ArUco markers using event camera GenX320 with 3D pose estimation.
+Track 2 ArUco markers and measuring distance using event camera GenX320 with 3D pose estimation.
 
 ## Features
 
 - Real-time marker detection and tracking
-- Template-based pattern matching for event camera images
 - 3D position estimation (X, Y, Z)
 
 ## Requirements
 
+- Marker: Dict 4x4 ID 06/07
 - Python 3.x
 - OpenCV
 - NumPy
